@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Direct Monte-Carlo Simulator</title>
+    <script src="https://cdn.jsdelivr.net"></script>
+    <script src="https://cdn.jsdelivr.net"></script>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background: #f4f7f6; color: #333; }
+        .container { max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        textarea { width: 100%; height: 150px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; padding: 10px; }
+        button { background: #ffcc00; border: none; padding: 10px 20px; font-weight: bold; cursor: pointer; border-radius: 4px; }
+        button:hover { background: #f0c000; }
+        #results { margin-top: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .stat-card { background: #f9f9f9; padding: 15px; border-radius: 6px; border-left: 5px solid #ffcc00; }
+        canvas { margin-top: 20px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Симулятор аукциона Яндекс.Директ</h2>
+    <p>Скопируйте `<tr>` или всю таблицу из "Прогноза бюджета" и вставьте ниже:</p>
+    <textarea id="htmlInput" placeholder="Вставьте HTML код строки фразы здесь..."></textarea>
+    <button onclick="processData()">Запустить симуляцию</button>
+
+    <div id="results" style="display:none;">
+        <div class="stat-card">
+            <h3>Прогноз кликов</h3>
+            <p id="clickMean">Среднее: --</p>
+            <small id="clickRange">Диапазон (95%): --</small>
+        </div>
+        <div class="stat-card">
+            <h3>Прогноз бюджета</h3>
+            <p id="costMean">Среднее: --</p>
+            <small id="costSafe">Безопасный остаток: --</small>
+        </div>
+    </div>
+    
+    <canvas id="distChart" width="400" height="200"></canvas>
+</div>
+
+<script>
+    let chart;
+
+    async function processData() {
+        const html = document.getElementById('htmlInput').value;
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(`<table>${html}</table>`, 'text/html');
+
+        try {
+            // 1. Парсинг данных
+            const keyword = doc.querySelector('.js-phrase-cell').innerText.trim();
+            const totalRequests = parseInt(doc.querySelector('.js-requests-cell').innerText.replace(/\s/g, ''));
+            
+            // Собираем данные по позициям (CTR и Списываемая цена)
+            const ctrs = Array.from(doc.querySelectorAll('.js-ctr-values-by-positions .js-value')).map(el => parseFloat(el.innerText));
+            const prices = Array.from(doc.querySelectorAll('.js-amnesty_price-values-by-positions .js-value')).map(el => parseFloat(el.innerText));
+            const volumes = [100, 85, 62, 9, 5];
+
+            // Находим активную позицию (обычно вторая li с классом active)
+            const activeIdx = Array.from(doc.querySelectorAll('.js-positions-list li')).findIndex(li => li.classList.contains('active'));
+            
+            const phraseData = {
+                keyword,
+                totalRequests,
+                active: { ctr: ctrs[activeIdx], price: prices[activeIdx], vol: volumes[activeIdx] }
+            };
+
+            runSimulation(phraseData);
+        } catch (e) {
+            alert("Ошибка парсинга. Пожалуйста, убедитесь, что скопировали строку таблицы целиком.");
+            console.error(e);
+        }
+    }
+
+    async function runSimulation(data) {
+        const iterations = 5000;
+        const n = data.totalRequests;
+        const p = data.active.ctr / 100;
+        const avgCpc = data.active.price;
+
+        const { clicks, costs } = tf.tidy(() => {
+            const mu = n * p;
+            const sigma = Math.sqrt(n * p * (1 - p)) * 1.5; // Увеличиваем sigma для учета неравномерности
+            
+            const clicksDist = tf.randomNormal([iterations], mu, sigma);
+            const cpcVolatility = tf.randomUniform([iterations], avgCpc * 0.8, avgCpc * 1.2);
+            const costsDist = clicksDist.mul(cpcVolatility);
+            
+            return { clicks: clicksDist.dataSync(), costs: costsDist.dataSync() };
+        });
+
+        // Отрисовка результатов
+        document.getElementById('results').style.display = 'grid';
+        const sortedClicks = Array.from(clicks).sort((a, b) => a - b);
+        const sortedCosts = Array.from(costs).sort((a, b) => a - b);
+
+        document.getElementById('clickMean').innerText = `Среднее: ${Math.round(sortedClicks[2500])} кликов`;
+        document.getElementById('clickRange').innerText = `Диапазон: ${Math.round(sortedClicks[125])} - ${Math.round(sortedClicks[4875])}`;
+        
+        document.getElementById('costMean').innerText = `Среднее: ${Math.round(sortedCosts[2500]).toLocaleString()} руб.`;
+        document.getElementById('costSafe').innerText = `Нужно на балансе (95% уверенности): ${Math.round(sortedCosts[4750]).toLocaleString()} руб.`;
+
+        updateChart(sortedClicks);
+    }
+
+    function updateChart(data) {
+        const ctx = document.getElementById('distChart').getContext('2d');
+        if (chart) chart.destroy();
+
+        // Строим гистограмму распределения
+        const bins = 40;
+        const min = data[0];
+        const max = data[data.length - 1];
+        const step = (max - min) / bins;
+        const histogram = new Array(bins).fill(0);
+        
+        data.forEach(v => {
+            const binIdx = Math.min(Math.floor((v - min) / step), bins - 1);
+            histogram[binIdx]++;
+        });
+
+        chart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: histogram.map((_, i) => Math.round(min + i * step)),
+                datasets: [{
+                    label: 'Вероятность исхода (количество кликов)',
+                    data: histogram,
+                    backgroundColor: '#ffcc00'
+                }]
+            },
+            options: { scales: { y: { display: false } } }
+        });
+    }
+</script>
+</body>
+</html>
